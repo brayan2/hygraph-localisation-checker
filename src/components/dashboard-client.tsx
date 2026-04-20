@@ -66,6 +66,9 @@ export function DashboardClient() {
       ])
 
       setLocales(fetchedLocales)
+      // Persist default locale for drill-down pages
+      const defaultLocale = fetchedLocales.find((l) => l.isDefault)?.apiId ?? fetchedLocales[0]?.apiId ?? 'en'
+      sessionStorage.setItem('hg_default_locale', defaultLocale)
 
       const initialData: ModelLocalisationData[] = models.map((m) => ({
         model: m,

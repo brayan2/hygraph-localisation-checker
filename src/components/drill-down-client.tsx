@@ -56,16 +56,19 @@ export function DrillDownClient({ modelApiId, locale, modelDisplayName }: Props)
     setEntries([])
 
     try {
-      const modelType = modelApiId.endsWith('s')
-        ? modelApiId.slice(0, -1).charAt(0).toUpperCase() + modelApiId.slice(1, -1)
-        : modelApiId.charAt(0).toUpperCase() + modelApiId.slice(1)
+      // Derive the singular PascalCase type name from the plural camelCase apiId
+      // e.g. "blogPosts" -> "BlogPost", "categories" -> "Category"
+      const singular = modelApiId.replace(/ies$/, 'y').replace(/s$/, '')
+      const modelType = singular.charAt(0).toUpperCase() + singular.slice(1)
+
+      const defaultLocale = sessionStorage.getItem('hg_default_locale') ?? 'en'
 
       const missing = await fetchMissingForLocale(
         { endpoint, token },
         modelApiId,
         modelType,
         locale,
-        endpoint,
+        defaultLocale,
         (fetched) => setProgress(fetched),
       )
       setEntries(missing)
