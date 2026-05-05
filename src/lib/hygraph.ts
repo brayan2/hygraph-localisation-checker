@@ -20,7 +20,15 @@ async function gql(
     body: JSON.stringify({ query, variables }),
   })
 
-  const json = await res.json()
+  // Avoid res.json() throw if response is not JSON
+  let json: any
+  try {
+    json = await res.json()
+  } catch {
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+    throw new Error('Invalid JSON response')
+  }
+
   if (!res.ok) {
     const errorMsg = json.errors?.[0]?.message || `${res.status} ${res.statusText}`
     throw new Error(errorMsg)
@@ -133,14 +141,40 @@ export async function fetchTotalCount(
   modelApiId: string,
   defaultLocale: string,
 ): Promise<number> {
-  const data = await gql(creds.endpoint, creds.token, `
-    query TotalCount {
-      result: ${modelApiId}Connection {
-        aggregate { count }
+  try {
+    const data = await gql(creds.endpoint, creds.token, `
+      query TotalCount {
+        result: ${modelApiId}Connection {
+          aggregate { count }
+        }
+      }
+    `)
+    return data.result?.aggregate?.count ?? 0
+  } catch (err) {
+    // Fallback: If Connection query fails (likely due to token permissions or schema version),
+    // we have to iteratively count. We use a first: 1000 approach to get it done faster.
+    let total = 0
+    let skip = 0
+    const PAGE = 1000
+    while (true) {
+      try {
+        const data = await gql(creds.endpoint, creds.token, `
+          query CountFallback($skip: Int!) {
+            entries: ${modelApiId}(locales: [${defaultLocale}], first: ${PAGE}, skip: $skip) { id }
+          }
+        `, { skip })
+        const count = (data.entries as Array<unknown>)?.length ?? 0
+        total += count
+        if (count < PAGE) break
+        skip += PAGE
+        // Cap fallback count to avoid infinite loops if schema is weird
+        if (skip > 10000) break 
+      } catch {
+        break
       }
     }
-  `)
-  return data.result?.aggregate?.count ?? 0
+    return total
+  }
 }
 
 export async function fetchLocalisationCounts(
@@ -297,11 +331,9 @@ export async function fetchEntryList(
         ${titleField ?? ''}
         localizations(locales: [${allLocaleIds}]) { locale }
       }
-      total: ${modelApiId}Connection { aggregate { count } }
     }
   `, { first, skip })
 
-  const projectId = extractProjectId(creds.endpoint)
   return {
     entries: ((data.entries ?? []) as Array<Record<string, unknown>>).map(e => {
       const presentLocales = new Set(
@@ -316,7 +348,7 @@ export async function fetchEntryList(
           : '#',
       }
     }),
-    total: (data.total as { aggregate: { count: number } } | null)?.aggregate?.count ?? 0,
+    total: 0, // Total is handled separately by the dashboard calling fetchTotalCount
   }
 }
 
