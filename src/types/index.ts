@@ -57,3 +57,33 @@ export interface ModelStageHealth {
   counts: StageHealthCount[] | null
   status: 'loading' | 'done' | 'error'
 }
+
+// ─── Hierarchical drill-down ──────────────────────────────────────────────────
+
+export interface EntryListItem {
+  id: string
+  title: string
+  /** locale apiId → true if that locale exists on this entry */
+  localePresentMap: Record<string, boolean>
+  studioUrl: string
+}
+
+export interface FieldCoverageItem {
+  name: string
+  displayName: string
+  typeName: string
+  defaultValue: string | null
+  targetValue: string | null
+  isCovered: boolean
+}
+
+export interface EntryFieldCoverage {
+  entryId: string
+  entryTitle: string
+  defaultLocale: string
+  targetLocale: string
+  fields: FieldCoverageItem[]
+  coveredCount: number
+  totalCount: number
+  entryHasLocale: boolean
+}

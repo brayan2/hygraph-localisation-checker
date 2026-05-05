@@ -1,4 +1,12 @@
-import type { HygraphCredentials, HygraphLocale, HygraphModel, MissingEntry } from '@/types'
+import type {
+  HygraphCredentials,
+  HygraphLocale,
+  HygraphModel,
+  MissingEntry,
+  EntryListItem,
+  FieldCoverageItem,
+  EntryFieldCoverage,
+} from '@/types'
 
 async function gql(
   endpoint: string,
@@ -24,6 +32,16 @@ function unwrapType(ref: { kind: string; name?: string; ofType?: unknown }): str
   return null
 }
 
+function extractProjectId(endpoint: string): string {
+  return endpoint.match(/\/content\/([a-zA-Z0-9]+)\//)?.[1] ?? ''
+}
+
+const SYSTEM_FIELDS = new Set([
+  'id', 'stage', 'locale', 'localizations', 'documentInStages',
+  'createdAt', 'updatedAt', 'publishedAt', 'createdBy', 'updatedBy', 'publishedBy',
+  'scheduledIn', 'history',
+])
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function validateCredentials(creds: HygraphCredentials): Promise<void> {
@@ -31,21 +49,44 @@ export async function validateCredentials(creds: HygraphCredentials): Promise<vo
 }
 
 export async function fetchLocales(creds: HygraphCredentials): Promise<HygraphLocale[]> {
+  // Fetch enum values and schema query args in one round-trip
   const data = await gql(creds.endpoint, creds.token, `
-    query { __type(name: "Locale") { enumValues { name } } }
+    query {
+      __type(name: "Locale") { enumValues { name } }
+      __schema { queryType { fields { name args { name defaultValue } } } }
+    }
   `)
   const values: Array<{ name: string }> = data?.__type?.enumValues ?? []
   if (!values.length) throw new Error('No locales found — is localisation enabled on this project?')
-  return values.map((v, i) => ({
+
+  // Read the actual default locale from the schema: the 'locales' arg on any
+  // localized query field has a defaultValue like "[en]" or "[en_US]"
+  let defaultApiId = values[0]?.name
+  try {
+    const fields: Array<{ args: Array<{ name: string; defaultValue: string | null }> }> =
+      data.__schema?.queryType?.fields ?? []
+    outer: for (const f of fields) {
+      for (const a of f.args) {
+        if (a.name === 'locales' && a.defaultValue) {
+          const m = a.defaultValue.match(/\b(\w+)\b/)
+          if (m?.[1] && values.some(v => v.name === m[1])) {
+            defaultApiId = m[1]
+            break outer
+          }
+        }
+      }
+    }
+  } catch { /* fallback to first */ }
+
+  return values.map(v => ({
     id: v.name,
     apiId: v.name,
     displayName: v.name.replace(/_/g, '-'),
-    isDefault: i === 0,
+    isDefault: v.name === defaultApiId,
   }))
 }
 
 export async function fetchModels(creds: HygraphCredentials): Promise<HygraphModel[]> {
-  // Two separate queries — combining them triggers a 500 on some Hygraph instances
   const [typesData, queryData] = await Promise.all([
     gql(creds.endpoint, creds.token, `
       query { __schema { types { name kind fields { name } } } }
@@ -67,19 +108,14 @@ export async function fetchModels(creds: HygraphCredentials): Promise<HygraphMod
     (queryData.__schema.queryType.fields as Array<{ name: string }>).map(f => f.name),
   )
 
-  // Match each localized type to its plural query field by convention
   function pluralApiId(typeName: string): string | null {
     const c = typeName.charAt(0).toLowerCase() + typeName.slice(1)
-    // Already plural (type name ends with s and exact field exists with Connection)
     if (allFieldNames.has(c) && allFieldNames.has(c + 'Connection')) return c
-    // Regular pluralisation: add s
     if (allFieldNames.has(c + 's') && allFieldNames.has(c + 'sConnection')) return c + 's'
-    // y → ies
     if (c.endsWith('y')) {
       const ies = c.slice(0, -1) + 'ies'
       if (allFieldNames.has(ies) && allFieldNames.has(ies + 'Connection')) return ies
     }
-    // add es
     if (allFieldNames.has(c + 'es') && allFieldNames.has(c + 'esConnection')) return c + 'es'
     return null
   }
@@ -99,9 +135,13 @@ export async function fetchModels(creds: HygraphCredentials): Promise<HygraphMod
   return models
 }
 
-export async function fetchTotalCount(creds: HygraphCredentials, modelApiId: string): Promise<number> {
+export async function fetchTotalCount(
+  creds: HygraphCredentials,
+  modelApiId: string,
+  defaultLocale: string,
+): Promise<number> {
   const data = await gql(creds.endpoint, creds.token, `
-    query { result: ${modelApiId}Connection { aggregate { count } } }
+    query { result: ${modelApiId}Connection(locales: [${defaultLocale}]) { aggregate { count } } }
   `)
   return data.result?.aggregate?.count ?? 0
 }
@@ -112,11 +152,9 @@ export async function fetchLocalisationCounts(
   locales: string[],
   total: number,
 ): Promise<Record<string, number>> {
-  // Try server-side count first (fast)
   try {
     return await countViaWhere(creds, modelApiId, locales)
   } catch {
-    // 500 from server — fall back to scanning entries client-side (reliable)
     return await countViaScan(creds, modelApiId, locales, total)
   }
 }
@@ -238,8 +276,149 @@ export async function fetchMissingForLocale(
   return missing
 }
 
-function extractProjectId(endpoint: string): string {
-  return endpoint.match(/\/content\/([a-zA-Z0-9]+)\//)?.[1] ?? ''
+// ─── Hierarchical drill-down ──────────────────────────────────────────────────
+
+export async function fetchEntryList(
+  creds: HygraphCredentials,
+  modelApiId: string,
+  modelType: string,
+  locales: HygraphLocale[],
+  defaultLocale: string,
+  first: number,
+  skip: number,
+): Promise<{ entries: EntryListItem[]; total: number }> {
+  const titleField = await fetchTitleField(creds, modelType)
+  const data = await gql(creds.endpoint, creds.token, `
+    query {
+      entries: ${modelApiId}(locales: [${defaultLocale}], first: ${first}, skip: ${skip}) {
+        id
+        ${titleField ?? ''}
+        localizations { locale }
+      }
+      total: ${modelApiId}Connection(locales: [${defaultLocale}]) { aggregate { count } }
+    }
+  `)
+
+  const projectId = extractProjectId(creds.endpoint)
+  return {
+    entries: ((data.entries ?? []) as Array<Record<string, unknown>>).map(e => {
+      const presentLocales = new Set(
+        (e.localizations as Array<{ locale: string }>).map(l => l.locale),
+      )
+      return {
+        id: e.id as string,
+        title: titleField ? String(e[titleField] ?? '') || (e.id as string) : (e.id as string),
+        localePresentMap: Object.fromEntries(locales.map(l => [l.apiId, presentLocales.has(l.apiId)])),
+        studioUrl: projectId
+          ? `https://app.hygraph.com/${projectId}/master/content/${modelType}/view/${e.id}`
+          : '#',
+      }
+    }),
+    total: (data.total as { aggregate: { count: number } } | null)?.aggregate?.count ?? 0,
+  }
+}
+
+export async function fetchLocalizableFields(
+  creds: HygraphCredentials,
+  modelType: string,
+): Promise<Array<{ name: string; typeName: string; isRichText: boolean }>> {
+  // Hygraph exposes exactly the localizable fields via the ${ModelType}Locale type
+  const data = await gql(creds.endpoint, creds.token, `
+    query {
+      localeType: __type(name: "${modelType}Locale") {
+        fields { name type { kind name ofType { kind name ofType { kind name } } } }
+      }
+    }
+  `)
+
+  const fields: Array<{ name: string; type: { kind: string; name?: string; ofType?: unknown } }> =
+    data.localeType?.fields ?? []
+
+  return fields
+    .filter(f => !SYSTEM_FIELDS.has(f.name))
+    .map(f => {
+      const typeName = unwrapType(f.type) ?? f.type.name ?? 'String'
+      return { name: f.name, typeName, isRichText: typeName.includes('RichText') }
+    })
+}
+
+export async function fetchEntryFieldCoverage(
+  creds: HygraphCredentials,
+  modelApiId: string,
+  modelType: string,
+  entryId: string,
+  defaultLocale: string,
+  targetLocale: string,
+): Promise<EntryFieldCoverage> {
+  const [localizableFields, titleField] = await Promise.all([
+    fetchLocalizableFields(creds, modelType),
+    fetchTitleField(creds, modelType),
+  ])
+
+  const isSameLocale = defaultLocale === targetLocale
+  const localesToFetch = isSameLocale ? [defaultLocale] : [defaultLocale, targetLocale]
+
+  const fieldSelections = localizableFields
+    .map(f => (f.isRichText ? `${f.name} { text }` : f.name))
+    .join('\n')
+
+  let entry: Record<string, unknown> | null = null
+
+  if (fieldSelections) {
+    const data = await gql(creds.endpoint, creds.token, `
+      query {
+        entries: ${modelApiId}(
+          locales: [${localesToFetch.join(', ')}],
+          where: { id: "${entryId}" }
+        ) {
+          id
+          ${titleField ?? ''}
+          localizations(locales: [${localesToFetch.join(', ')}]) {
+            locale
+            ${fieldSelections}
+          }
+        }
+      }
+    `)
+    entry = ((data.entries as Array<Record<string, unknown>>) ?? [])[0] ?? null
+  }
+
+  if (!entry) throw new Error('Entry not found')
+
+  function stringify(v: unknown): string | null {
+    if (v === null || v === undefined) return null
+    if (typeof v === 'object') return (v as { text?: string }).text ?? null
+    const s = String(v)
+    return s === '' ? null : s
+  }
+
+  const locs = (entry.localizations as Array<Record<string, unknown>>) ?? []
+  const defaultLoc = locs.find(l => l.locale === defaultLocale) ?? {}
+  const targetLoc = locs.find(l => l.locale === targetLocale) ?? null
+
+  const fields: FieldCoverageItem[] = localizableFields.map(f => {
+    const defaultValue = stringify(defaultLoc[f.name])
+    const targetValue = targetLoc ? stringify(targetLoc[f.name]) : null
+    return {
+      name: f.name,
+      displayName: f.name.replace(/([A-Z])/g, ' $1').replace(/^./, s => s.toUpperCase()).trim(),
+      typeName: f.typeName,
+      defaultValue,
+      targetValue,
+      isCovered: targetValue !== null,
+    }
+  })
+
+  return {
+    entryId,
+    entryTitle: titleField ? String(entry[titleField] ?? '') || entryId : entryId,
+    defaultLocale,
+    targetLocale,
+    fields,
+    coveredCount: fields.filter(f => f.isCovered).length,
+    totalCount: fields.length,
+    entryHasLocale: targetLoc !== null,
+  }
 }
 
 export async function fetchLocalizationStageHealth(
@@ -249,7 +428,6 @@ export async function fetchLocalizationStageHealth(
 ): Promise<{ locale: string; published: number; draftOnly: number }[] | null> {
   if (!locales.length) return []
 
-  // Attempt 1: fast aggregate using stage on the connection query
   try {
     const aliases = locales.flatMap((l, i) => [
       `d${i}: ${modelApiId}Connection(stage: DRAFT, where: { localizations_some: { locale: ${l} } }) { aggregate { count } }`,
@@ -261,9 +439,8 @@ export async function fetchLocalizationStageHealth(
       const published = data[`p${i}`]?.aggregate?.count ?? 0
       return { locale: l, published, draftOnly: Math.max(0, draft - published) }
     })
-  } catch { /* fall through to scan */ }
+  } catch { /* fall through */ }
 
-  // Attempt 2: scan using localizations(stages: [DRAFT, PUBLISHED]) sub-field
   try {
     const PAGE = 500
     const counts: Record<string, { draft: number; published: number }> =
@@ -302,8 +479,6 @@ export async function fetchLocalizationStageHealth(
     }))
   } catch { /* fall through */ }
 
-  // Attempt 3: dual scan — stage on the outer list query (not Connection) + localizations(locales: [...])
-  // stage: DRAFT on list queries is valid in Hygraph v2; localizations sub-field inherits the stage context
   try {
     const localeFields = locales
       .map((l, i) => `loc${i}: localizations(locales: [${l}]) { locale }`)
@@ -340,8 +515,6 @@ export async function fetchLocalizationStageHealth(
       scanStage('PUBLISHED'),
     ])
 
-    // If counts are identical, localizations sub-field doesn't inherit stage context —
-    // this approach can't distinguish draft-only from published; signal unsupported
     const hasDiff = locales.some(l => (draftCounts[l] ?? 0) !== (publishedCounts[l] ?? 0))
     if (!hasDiff && locales.some(l => (publishedCounts[l] ?? 0) > 0)) return null
 

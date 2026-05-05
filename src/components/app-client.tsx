@@ -6,7 +6,6 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { ThemeToggle } from '@/components/theme-toggle'
 import {
   validateCredentials,
@@ -14,16 +13,18 @@ import {
   fetchModels,
   fetchTotalCount,
   fetchLocalisationCounts,
-  fetchMissingForLocale,
   fetchLocalizationStageHealth,
+  fetchEntryList,
+  fetchEntryFieldCoverage,
 } from '@/lib/hygraph'
 import type {
   HygraphCredentials,
   HygraphLocale,
   HygraphModel,
   ModelLocalisationData,
-  MissingEntry,
   ModelStageHealth,
+  EntryListItem,
+  EntryFieldCoverage,
 } from '@/types'
 import {
   AlertCircle,
@@ -31,6 +32,7 @@ import {
   ArrowLeft,
   BookOpen,
   CheckCircle2,
+  ChevronRight,
   Download,
   ExternalLink,
   Eye,
@@ -40,20 +42,17 @@ import {
   Loader2,
   LogOut,
   RefreshCw,
-  Search,
   Stethoscope,
   XCircle,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Navigation types ─────────────────────────────────────────────────────────
 
-interface DrillDown {
-  modelApiId: string
-  modelType: string
-  modelDisplayName: string
-  locale: string
-}
+type CoverageView =
+  | { kind: 'matrix' }
+  | { kind: 'entries'; model: HygraphModel; localeFilter: string | null }
+  | { kind: 'fields'; model: HygraphModel; entry: EntryListItem; locale: string }
 
 type Tab = 'coverage' | 'diagnostics' | 'guide'
 
@@ -77,7 +76,6 @@ function StatusDot({ pct }: { pct: number }) {
 export function AppClient() {
   const [creds, setCreds] = useState<HygraphCredentials | null>(null)
   const [defaultLocale, setDefaultLocale] = useState('en')
-  const [drillDown, setDrillDown] = useState<DrillDown | null>(null)
   const [activeTab, setActiveTab] = useState<Tab>('coverage')
 
   function handleConnected(c: HygraphCredentials, dl: string) {
@@ -87,7 +85,6 @@ export function AppClient() {
 
   function handleDisconnect() {
     setCreds(null)
-    setDrillDown(null)
     setActiveTab('coverage')
   }
 
@@ -172,7 +169,7 @@ export function AppClient() {
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6 sm:py-8">
         {activeTab === 'coverage' && (
           creds
-            ? <DashboardContent creds={creds} defaultLocale={defaultLocale} onDrillDown={setDrillDown} />
+            ? <DashboardContent creds={creds} defaultLocale={defaultLocale} />
             : <EmptyState />
         )}
         {activeTab === 'diagnostics' && (
@@ -182,20 +179,6 @@ export function AppClient() {
         )}
         {activeTab === 'guide' && <SetupGuideContent />}
       </main>
-
-      {/* ── Drill-down sheet ──────────────────────────────────────────────── */}
-      <Sheet open={!!drillDown} onOpenChange={(o) => { if (!o) setDrillDown(null) }}>
-        <SheetContent side="right" className="w-full sm:max-w-2xl p-0 flex flex-col gap-0">
-          {drillDown && creds && (
-            <DrillDownPanel
-              creds={creds}
-              drillDown={drillDown}
-              defaultLocale={defaultLocale}
-              onClose={() => setDrillDown(null)}
-            />
-          )}
-        </SheetContent>
-      </Sheet>
     </div>
   )
 }
@@ -227,8 +210,8 @@ function ConnectBar({
       if (!ep.startsWith('https://')) throw new Error('Endpoint must start with https://')
       const c = { endpoint: ep, token: tk }
       await validateCredentials(c)
-      let dl = 'en'
-      try { dl = (await fetchLocales(c))[0]?.apiId ?? 'en' } catch { /* fallback */ }
+      const locales = await fetchLocales(c)
+      const dl = locales.find(l => l.isDefault)?.apiId ?? locales[0]?.apiId ?? 'en'
       onConnected(c, dl)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Connection failed'
@@ -348,28 +331,33 @@ function EmptyState() {
 
 // ─── Coverage dashboard ───────────────────────────────────────────────────────
 
+// ─── Coverage tab — hierarchical navigation ───────────────────────────────────
+
 function DashboardContent({
   creds,
-  defaultLocale,
-  onDrillDown,
+  defaultLocale: propDefaultLocale,
 }: {
   creds: HygraphCredentials
   defaultLocale: string
-  onDrillDown: (d: DrillDown) => void
 }) {
   const [locales, setLocales] = useState<HygraphLocale[]>([])
-  const [data, setData] = useState<ModelLocalisationData[]>([])
+  const [matrixData, setMatrixData] = useState<ModelLocalisationData[]>([])
   const [booting, setBooting] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [view, setView] = useState<CoverageView>({ kind: 'matrix' })
+
+  // Use the default locale derived from the loaded locales (accurate) or fall back to prop
+  const defaultLocale = locales.find(l => l.isDefault)?.apiId ?? propDefaultLocale
 
   const load = useCallback(async () => {
     setBooting(true)
     setError(null)
-    setData([])
+    setMatrixData([])
     try {
       const [locs, models] = await Promise.all([fetchLocales(creds), fetchModels(creds)])
       setLocales(locs)
-      setData(models.map(m => ({
+      const dl = locs.find(l => l.isDefault)?.apiId ?? locs[0]?.apiId ?? 'en'
+      setMatrixData(models.map(m => ({
         model: m,
         totalEntries: 0,
         locales: locs.map(l => ({ locale: l.apiId, total: 0, translated: 0, percentage: 0 })),
@@ -379,21 +367,27 @@ function DashboardContent({
 
       for (const model of models) {
         try {
-          const total = await fetchTotalCount(creds, model.apiId)
-          const counts = await fetchLocalisationCounts(creds, model.apiId, locs.map(l => l.apiId), total)
-          setData(prev => prev.map(d => d.model.id !== model.id ? d : {
+          const total = await fetchTotalCount(creds, model.apiId, dl)
+          const nonDefaultLocales = locs.filter(l => !l.isDefault).map(l => l.apiId)
+          const counts = nonDefaultLocales.length
+            ? await fetchLocalisationCounts(creds, model.apiId, nonDefaultLocales, total)
+            : {}
+          setMatrixData(prev => prev.map(d => d.model.id !== model.id ? d : {
             ...d,
             totalEntries: total,
             locales: locs.map(l => ({
               locale: l.apiId,
               total,
-              translated: counts[l.apiId] ?? 0,
-              percentage: total > 0 ? Math.round(((counts[l.apiId] ?? 0) / total) * 100) : 100,
+              // Default locale is always 100% by definition
+              translated: l.isDefault ? total : (counts[l.apiId] ?? 0),
+              percentage: l.isDefault
+                ? 100
+                : total > 0 ? Math.round(((counts[l.apiId] ?? 0) / total) * 100) : 100,
             })),
             status: 'done',
           }))
         } catch {
-          setData(prev => prev.map(d => d.model.id !== model.id ? d : { ...d, status: 'error' }))
+          setMatrixData(prev => prev.map(d => d.model.id !== model.id ? d : { ...d, status: 'error' }))
         }
       }
     } catch (err) {
@@ -404,7 +398,36 @@ function DashboardContent({
 
   useEffect(() => { load() }, [load])
 
-  const done = data.filter(d => d.status === 'done')
+  if (view.kind === 'entries') {
+    return (
+      <EntryListView
+        creds={creds}
+        model={view.model}
+        locales={locales}
+        defaultLocale={defaultLocale}
+        localeFilter={view.localeFilter}
+        onViewFields={(entry, locale) => setView({ kind: 'fields', model: view.model, entry, locale })}
+        onBack={() => setView({ kind: 'matrix' })}
+      />
+    )
+  }
+
+  if (view.kind === 'fields') {
+    return (
+      <FieldCoverageView
+        creds={creds}
+        model={view.model}
+        entry={view.entry}
+        locales={locales.filter(l => !l.isDefault)}
+        defaultLocale={defaultLocale}
+        initialLocale={view.locale}
+        onBack={() => setView({ kind: 'entries', model: view.model, localeFilter: view.locale })}
+      />
+    )
+  }
+
+  // ── Matrix view ──────────────────────────────────────────────────────────────
+  const done = matrixData.filter(d => d.status === 'done')
   const overallPct = done.length && locales.length
     ? Math.round(done.flatMap(d => d.locales).reduce((s, l) => s + l.percentage, 0) / (done.length * locales.length))
     : 0
@@ -431,20 +454,19 @@ function DashboardContent({
       <XCircle className="w-10 h-10 text-destructive" />
       <p className="font-semibold">Failed to load project</p>
       <p className="text-sm text-muted-foreground">{error}</p>
-      <Button onClick={load} variant="outline" className="gap-2">
-        <RefreshCw className="w-4 h-4" /> Try again
-      </Button>
+      <Button onClick={load} variant="outline" className="gap-2"><RefreshCw className="w-4 h-4" /> Try again</Button>
     </div>
   )
 
   return (
     <div className="space-y-4">
-      {/* Toolbar */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-lg font-bold tracking-tight">Translation Coverage</h1>
           <p className="text-xs text-muted-foreground mt-0.5">
-            {booting ? 'Loading models…' : `${data.length} localised models · click any cell to inspect missing entries`}
+            {booting
+              ? 'Loading models…'
+              : `${matrixData.length} localised models · click a model or locale cell to drill in`}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -454,22 +476,17 @@ function DashboardContent({
               overallPct === 100 ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
                 : overallPct >= 75 ? 'bg-amber-400/15 text-amber-700 dark:text-amber-400'
                 : 'bg-destructive/10 text-destructive',
-            )}>
-              {overallPct}% overall
-            </Badge>
+            )}>{overallPct}% overall</Badge>
           )}
           <Button variant="outline" size="sm" onClick={load} className="h-8 gap-1.5">
-            <RefreshCw className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Refresh</span>
+            <RefreshCw className="w-3.5 h-3.5" /><span className="hidden sm:inline">Refresh</span>
           </Button>
           <Button variant="outline" size="sm" onClick={exportCSV} disabled={!done.length} className="h-8 gap-1.5">
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Export CSV</span>
+            <Download className="w-3.5 h-3.5" /><span className="hidden sm:inline">Export CSV</span>
           </Button>
         </div>
       </div>
 
-      {/* Matrix */}
       <div className="rounded-xl border border-border overflow-hidden shadow-sm">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -504,13 +521,18 @@ function DashboardContent({
                       ))}
                     </tr>
                   ))
-                : data.map(row => (
-                    <tr key={row.model.id} className="bg-background hover:bg-muted/30 transition-colors">
+                : matrixData.map(row => (
+                    <tr key={row.model.id} className="bg-background hover:bg-muted/30 transition-colors group">
                       <td className="px-4 py-3 sticky left-0 bg-background font-medium">
-                        <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setView({ kind: 'entries', model: row.model, localeFilter: null })}
+                          className="flex items-center gap-2 text-left hover:text-primary transition-colors group-hover:underline underline-offset-2"
+                          disabled={row.status !== 'done'}
+                        >
                           {row.status === 'error' && <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />}
                           {row.model.displayName}
-                        </div>
+                          {row.status === 'done' && <ChevronRight className="w-3 h-3 opacity-0 group-hover:opacity-60 transition-opacity shrink-0" />}
+                        </button>
                       </td>
                       <td className="px-3 py-3 text-center tabular-nums text-muted-foreground">
                         {row.status === 'loading' ? <Skeleton className="h-4 w-8 mx-auto" />
@@ -522,7 +544,7 @@ function DashboardContent({
                         const pct = ld?.percentage ?? 0
                         const total = ld?.total ?? 0
                         const missing = total - (ld?.translated ?? 0)
-                        const canDrill = pct < 100 && total > 0 && row.status === 'done'
+                        const canDrill = total > 0 && row.status === 'done'
 
                         if (row.status === 'loading')
                           return <td key={locale.apiId} className="px-3 py-3 text-center"><Skeleton className="h-8 w-20 mx-auto rounded-lg" /></td>
@@ -534,12 +556,9 @@ function DashboardContent({
                             <Tooltip>
                               <TooltipTrigger
                                 disabled={!canDrill}
-                                onClick={canDrill ? () => onDrillDown({
-                                  modelApiId: row.model.apiId,
-                                  modelType: row.model.id,
-                                  modelDisplayName: row.model.displayName,
-                                  locale: locale.apiId,
-                                }) : undefined}
+                                onClick={canDrill
+                                  ? () => setView({ kind: 'entries', model: row.model, localeFilter: locale.isDefault ? null : locale.apiId })
+                                  : undefined}
                                 className={cn(
                                   'inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold tabular-nums transition-colors',
                                   cellColor(pct),
@@ -551,8 +570,8 @@ function DashboardContent({
                               </TooltipTrigger>
                               <TooltipContent side="top" className="text-xs">
                                 {total === 0 ? 'No entries'
-                                  : pct === 100 ? `All ${total} entries translated`
-                                  : <>{missing} missing of {total} · click to inspect</>}
+                                  : pct === 100 ? `All ${total} translated — click to inspect entries`
+                                  : <>{missing} of {total} missing · click to inspect</>}
                               </TooltipContent>
                             </Tooltip>
                           </td>
@@ -565,7 +584,6 @@ function DashboardContent({
         </div>
       </div>
 
-      {/* Legend */}
       {!booting && (
         <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
           {[
@@ -575,8 +593,7 @@ function DashboardContent({
             { c: 'bg-destructive/10', l: '0% — not started' },
           ].map(({ c, l }) => (
             <div key={l} className="flex items-center gap-1.5">
-              <div className={cn('w-3 h-3 rounded-sm', c)} />
-              {l}
+              <div className={cn('w-3 h-3 rounded-sm', c)} />{l}
             </div>
           ))}
         </div>
@@ -585,164 +602,442 @@ function DashboardContent({
   )
 }
 
-// ─── Drill-down panel ─────────────────────────────────────────────────────────
+// ─── Entry list view (Level 2) ────────────────────────────────────────────────
 
-function DrillDownPanel({
+const PAGE_SIZE = 30
+
+function EntryListView({
   creds,
-  drillDown,
+  model,
+  locales,
   defaultLocale,
-  onClose,
+  localeFilter,
+  onViewFields,
+  onBack,
 }: {
   creds: HygraphCredentials
-  drillDown: DrillDown
+  model: HygraphModel
+  locales: HygraphLocale[]
   defaultLocale: string
-  onClose: () => void
+  localeFilter: string | null
+  onViewFields: (entry: EntryListItem, locale: string) => void
+  onBack: () => void
 }) {
-  const [entries, setEntries] = useState<MissingEntry[]>([])
+  const [entries, setEntries] = useState<EntryListItem[]>([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
-  const [progress, setProgress] = useState(0)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [search, setSearch] = useState('')
 
-  const load = useCallback(async () => {
-    setLoading(true); setError(null); setProgress(0); setEntries([])
+  const load = useCallback(async (skip = 0, append = false) => {
+    if (!append) setLoading(true)
+    else setLoadingMore(true)
+    setError(null)
     try {
-      const missing = await fetchMissingForLocale(
-        creds, drillDown.modelApiId, drillDown.modelType,
-        drillDown.locale, defaultLocale, n => setProgress(n),
-      )
-      setEntries(missing)
+      const result = await fetchEntryList(creds, model.apiId, model.id, locales, defaultLocale, PAGE_SIZE, skip)
+      setEntries(prev => append ? [...prev, ...result.entries] : result.entries)
+      setTotal(result.total)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load')
+      setError(err instanceof Error ? err.message : 'Failed to load entries')
     } finally {
       setLoading(false)
+      setLoadingMore(false)
     }
-  }, [creds, drillDown, defaultLocale])
+  }, [creds, model, locales, defaultLocale])
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => { load(0) }, [load])
 
-  const filtered = entries.filter(
-    e => e.title.toLowerCase().includes(search.toLowerCase()) || e.id.toLowerCase().includes(search.toLowerCase()),
+  const filterLocale = localeFilter
+    ? locales.find(l => l.apiId === localeFilter)
+    : null
+
+  // When a locale filter is set, split entries into missing/present
+  const displayEntries = localeFilter
+    ? [...entries].sort((a, b) => {
+        const aHas = a.localePresentMap[localeFilter] ? 1 : 0
+        const bHas = b.localePresentMap[localeFilter] ? 1 : 0
+        return aHas - bHas // missing first
+      })
+    : entries
+
+  const missingCount = localeFilter
+    ? entries.filter(e => !e.localePresentMap[localeFilter]).length
+    : 0
+
+  const nonDefaultLocales = locales.filter(l => !l.isDefault)
+  const defaultLocaleObj = locales.find(l => l.isDefault)
+
+  if (error) return (
+    <div className="flex flex-col items-center gap-4 py-24 text-center">
+      <XCircle className="w-10 h-10 text-destructive" />
+      <p className="font-semibold">Failed to load entries</p>
+      <p className="text-sm text-muted-foreground">{error}</p>
+      <Button onClick={() => load(0)} variant="outline" className="gap-2"><RefreshCw className="w-4 h-4" /> Retry</Button>
+    </div>
   )
 
-  function exportCSV() {
-    const rows = [['Entry ID', 'Title', 'Missing Locale', 'Studio URL'],
-      ...entries.map(e => [e.id, e.title, drillDown.locale, e.studioUrl])]
-    const csv = rows.map(r => r.map(c => `"${c}"`).join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = `missing-${drillDown.locale}-${drillDown.modelApiId}.csv`
-    a.click()
-  }
-
   return (
-    <div className="flex flex-col h-full overflow-hidden">
-      <div className="px-6 py-4 border-b border-border shrink-0">
-        <div className="flex items-center gap-2 mb-0.5">
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors p-0.5 -ml-0.5">
-            <ArrowLeft className="w-4 h-4" />
-          </button>
-          <h2 className="font-semibold text-sm">
-            {drillDown.modelDisplayName} ·{' '}
-            <span className="text-primary">{drillDown.locale.replace(/_/g, '-')}</span>
-          </h2>
-        </div>
-        <p className="text-xs text-muted-foreground ml-6">
-          Entries missing a {drillDown.locale.replace(/_/g, '-')} translation
-        </p>
+    <div className="space-y-4">
+      {/* Breadcrumb */}
+      <div className="flex items-center gap-1.5 text-sm">
+        <button onClick={onBack} className="text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1">
+          <ArrowLeft className="w-3.5 h-3.5" />
+          Coverage
+        </button>
+        <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />
+        <span className="font-medium">{model.displayName}</span>
+        {filterLocale && (
+          <>
+            <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />
+            <span className="text-primary font-medium">{filterLocale.displayName}</span>
+          </>
+        )}
       </div>
 
-      {!loading && entries.length > 0 && (
-        <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border bg-muted/30 shrink-0">
-          <div className="relative flex-1">
-            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
-            <Input
-              placeholder="Search…"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              className="pl-8 h-8 text-sm bg-background"
-            />
-          </div>
-          <Badge variant="secondary" className="bg-destructive/10 text-destructive shrink-0 font-semibold">
-            {entries.length}
-          </Badge>
-          <Button variant="outline" size="sm" onClick={exportCSV} className="h-8 gap-1.5 shrink-0">
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">CSV</span>
-          </Button>
+      {/* Stats */}
+      {!loading && (
+        <div className="flex items-center gap-3 flex-wrap">
+          <p className="text-xs text-muted-foreground">
+            {total.toLocaleString()} {total === 1 ? 'entry' : 'entries'} in {model.displayName}
+          </p>
+          {filterLocale && missingCount > 0 && (
+            <Badge className="bg-destructive/10 text-destructive border-0 font-semibold text-xs">
+              {missingCount} missing {filterLocale.displayName}
+            </Badge>
+          )}
+          {filterLocale && missingCount === 0 && entries.length > 0 && (
+            <Badge className="bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-0 font-semibold text-xs">
+              All translated
+            </Badge>
+          )}
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto">
-        {error ? (
-          <div className="flex flex-col items-center gap-3 py-16 px-6 text-center">
-            <XCircle className="w-8 h-8 text-destructive" />
-            <p className="text-sm text-muted-foreground">{error}</p>
-            <Button onClick={load} variant="outline" size="sm" className="gap-2">
-              <RefreshCw className="w-3.5 h-3.5" /> Retry
-            </Button>
-          </div>
-        ) : loading ? (
-          <div className="px-6 py-4 space-y-3">
-            <p className="text-sm text-muted-foreground flex items-center gap-2">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Scanning{progress > 0 ? ` — ${progress} checked so far` : '…'}
-            </p>
-            {Array.from({ length: 7 }).map((_, i) => (
-              <div key={i} className="flex items-center justify-between py-2 gap-4">
-                <div className="space-y-1.5 flex-1">
-                  <Skeleton className="h-4 w-2/3" />
-                  <Skeleton className="h-3 w-1/3" />
-                </div>
-                <Skeleton className="h-7 w-20 rounded-lg shrink-0" />
-              </div>
-            ))}
-          </div>
-        ) : entries.length === 0 ? (
-          <div className="flex flex-col items-center gap-3 py-16 px-6 text-center">
-            <div className="w-12 h-12 rounded-full bg-emerald-500/15 flex items-center justify-center">
-              <CheckCircle2 className="w-6 h-6 text-emerald-600" />
-            </div>
-            <p className="font-semibold">All translated!</p>
-            <p className="text-sm text-muted-foreground">
-              Every {drillDown.modelDisplayName} entry has a {drillDown.locale.replace(/_/g, '-')} localisation.
-            </p>
-          </div>
-        ) : filtered.length === 0 ? (
-          <p className="py-12 text-center text-sm text-muted-foreground">
-            No entries match &ldquo;{search}&rdquo;
-          </p>
-        ) : (
-          <div className="divide-y divide-border/60">
-            {filtered.map((entry, i) => (
-              <div
-                key={entry.id}
-                className={cn(
-                  'flex items-center justify-between px-5 py-3 gap-4 hover:bg-muted/30 transition-colors',
-                  i % 2 === 1 && 'bg-muted/10',
+      {/* Table */}
+      <div className="rounded-xl border border-border overflow-hidden shadow-sm">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-muted/50 border-b border-border">
+                <th className="text-left px-4 py-3 font-semibold sticky left-0 bg-muted/50 min-w-[200px] z-10">Entry</th>
+                {defaultLocaleObj && (
+                  <th className="text-center px-3 py-3 font-semibold min-w-[90px]">
+                    {defaultLocaleObj.displayName}
+                    <span className="ml-1 text-[10px] text-muted-foreground font-normal">(default)</span>
+                  </th>
                 )}
-              >
-                <div className="min-w-0">
-                  <p className="text-sm font-medium truncate">{entry.title || '(Untitled)'}</p>
-                  <p className="text-xs text-muted-foreground font-mono mt-0.5 truncate">{entry.id}</p>
-                </div>
-                {entry.studioUrl !== '#' && (
-                  <a href={entry.studioUrl} target="_blank" rel="noopener noreferrer" className="shrink-0">
-                    <Button variant="outline" size="sm" className="gap-1.5 text-xs h-7">
-                      Studio <ExternalLink className="w-3 h-3" />
-                    </Button>
-                  </a>
-                )}
-              </div>
-            ))}
+                {nonDefaultLocales.map(l => (
+                  <th key={l.apiId} className="text-center px-3 py-3 font-semibold min-w-[90px]">{l.displayName}</th>
+                ))}
+                <th className="px-3 py-3 min-w-[80px]" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {loading
+                ? Array.from({ length: 8 }).map((_, i) => (
+                    <tr key={i} className="bg-background">
+                      <td className="px-4 py-3 sticky left-0 bg-background">
+                        <div className="space-y-1.5"><Skeleton className="h-4 w-40" /><Skeleton className="h-3 w-24" /></div>
+                      </td>
+                      {locales.map(l => (
+                        <td key={l.apiId} className="px-3 py-3 text-center"><Skeleton className="h-6 w-10 mx-auto rounded-full" /></td>
+                      ))}
+                      <td className="px-3 py-3"><Skeleton className="h-7 w-16 rounded-lg" /></td>
+                    </tr>
+                  ))
+                : displayEntries.map((entry) => (
+                    <tr
+                      key={entry.id}
+                      className="bg-background hover:bg-muted/30 transition-colors cursor-pointer"
+                      onClick={() => {
+                        const locale = filterLocale?.apiId ?? nonDefaultLocales[0]?.apiId ?? defaultLocale
+                        onViewFields(entry, locale)
+                      }}
+                    >
+                      <td className="px-4 py-3 sticky left-0 bg-background">
+                        <p className="font-medium truncate max-w-[220px]">{entry.title || '(Untitled)'}</p>
+                        <p className="text-[11px] text-muted-foreground font-mono mt-0.5 truncate">{entry.id}</p>
+                      </td>
+                      {defaultLocaleObj && (
+                        <td className="px-3 py-3 text-center">
+                          <LocaleBadge present={entry.localePresentMap[defaultLocaleObj.apiId] ?? false} />
+                        </td>
+                      )}
+                      {nonDefaultLocales.map(l => (
+                        <td
+                          key={l.apiId}
+                          className="px-3 py-3 text-center"
+                          onClick={e => { e.stopPropagation(); onViewFields(entry, l.apiId) }}
+                        >
+                          <LocaleBadge present={entry.localePresentMap[l.apiId] ?? false} highlight={localeFilter === l.apiId} />
+                        </td>
+                      ))}
+                      <td className="px-3 py-3 text-right">
+                        {entry.studioUrl !== '#' && (
+                          <a
+                            href={entry.studioUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={e => e.stopPropagation()}
+                          >
+                            <Button variant="ghost" size="sm" className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground">
+                              Studio <ExternalLink className="w-3 h-3" />
+                            </Button>
+                          </a>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {!loading && entries.length < total && (
+        <div className="flex justify-center">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => load(entries.length, true)}
+            disabled={loadingMore}
+            className="gap-2"
+          >
+            {loadingMore ? <><Loader2 className="w-3.5 h-3.5 animate-spin" />Loading…</> : `Load more (${total - entries.length} remaining)`}
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function LocaleBadge({ present, highlight }: { present: boolean; highlight?: boolean }) {
+  return present ? (
+    <span className={cn(
+      'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold',
+      highlight
+        ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-400'
+        : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    )}>
+      <CheckCircle2 className="w-3 h-3" />
+    </span>
+  ) : (
+    <span className={cn(
+      'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold',
+      highlight
+        ? 'bg-destructive/20 text-destructive'
+        : 'bg-destructive/10 text-destructive',
+    )}>
+      <XCircle className="w-3 h-3" />
+    </span>
+  )
+}
+
+// ─── Field coverage view (Level 3) ───────────────────────────────────────────
+
+function FieldCoverageView({
+  creds,
+  model,
+  entry,
+  locales,
+  defaultLocale,
+  initialLocale,
+  onBack,
+}: {
+  creds: HygraphCredentials
+  model: HygraphModel
+  entry: EntryListItem
+  locales: HygraphLocale[]
+  defaultLocale: string
+  initialLocale: string
+  onBack: () => void
+}) {
+  const [activeLocale, setActiveLocale] = useState(initialLocale)
+  const [coverage, setCoverage] = useState<EntryFieldCoverage | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const load = useCallback(async (locale: string) => {
+    setLoading(true)
+    setError(null)
+    setCoverage(null)
+    try {
+      const result = await fetchEntryFieldCoverage(creds, model.apiId, model.id, entry.id, defaultLocale, locale)
+      setCoverage(result)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load field data')
+    } finally {
+      setLoading(false)
+    }
+  }, [creds, model, entry, defaultLocale])
+
+  useEffect(() => { load(activeLocale) }, [activeLocale, load])
+
+  const defaultLocaleDisplay = defaultLocale.replace(/_/g, '-')
+  const activeLocaleObj = locales.find(l => l.apiId === activeLocale)
+
+  function truncate(v: string | null, max = 80): string {
+    if (!v) return ''
+    return v.length > max ? v.slice(0, max) + '…' : v
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Breadcrumb */}
+      <div className="flex items-center gap-1.5 text-sm flex-wrap">
+        <button onClick={onBack} className="text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1">
+          <ArrowLeft className="w-3.5 h-3.5" />
+          {model.displayName}
+        </button>
+        <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />
+        <span className="font-medium truncate max-w-[240px]">{entry.title || '(Untitled)'}</span>
+      </div>
+
+      {/* Locale tabs + stats */}
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex gap-1 flex-wrap">
+          {locales.map(l => (
+            <button
+              key={l.apiId}
+              onClick={() => setActiveLocale(l.apiId)}
+              className={cn(
+                'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border',
+                activeLocale === l.apiId
+                  ? 'bg-primary text-primary-foreground border-primary'
+                  : 'border-border text-muted-foreground hover:text-foreground hover:bg-muted/50',
+              )}
+            >
+              {l.displayName}
+              {!entry.localePresentMap[l.apiId] && (
+                <span className="ml-1.5 w-1.5 h-1.5 rounded-full bg-destructive inline-block" />
+              )}
+            </button>
+          ))}
+        </div>
+        {coverage && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              {coverage.entryHasLocale
+                ? `${coverage.coveredCount} / ${coverage.totalCount} fields translated`
+                : 'No translation exists yet'}
+            </span>
+            {coverage.totalCount > 0 && coverage.entryHasLocale && (
+              <Badge className={cn(
+                'font-semibold border-0 text-xs',
+                coverage.coveredCount === coverage.totalCount
+                  ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
+                  : coverage.coveredCount > 0
+                  ? 'bg-amber-400/15 text-amber-700 dark:text-amber-400'
+                  : 'bg-destructive/10 text-destructive',
+              )}>
+                {coverage.totalCount > 0 ? Math.round((coverage.coveredCount / coverage.totalCount) * 100) : 0}%
+              </Badge>
+            )}
           </div>
         )}
       </div>
 
-      {!loading && filtered.length < entries.length && (
-        <div className="px-5 py-2 border-t border-border text-xs text-muted-foreground text-right shrink-0">
-          Showing {filtered.length} of {entries.length}
+      {/* No locale warning */}
+      {!loading && coverage && !coverage.entryHasLocale && (
+        <div className="rounded-xl border border-amber-400/40 bg-amber-400/5 p-4 flex gap-3">
+          <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+          <p className="text-sm text-muted-foreground">
+            This entry has no <strong>{activeLocaleObj?.displayName ?? activeLocale.replace(/_/g, '-')}</strong> translation yet.
+            The default locale values are shown for reference.
+          </p>
+        </div>
+      )}
+
+      {/* Field table */}
+      <div className="rounded-xl border border-border overflow-hidden shadow-sm">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-muted/50 border-b border-border">
+              <th className="text-left px-4 py-3 font-semibold min-w-[140px]">Field</th>
+              <th className="text-left px-4 py-3 font-semibold min-w-[200px]">
+                {defaultLocaleDisplay} <span className="text-muted-foreground font-normal text-xs">(default)</span>
+              </th>
+              <th className="text-left px-4 py-3 font-semibold min-w-[200px]">
+                {activeLocaleObj?.displayName ?? activeLocale.replace(/_/g, '-')}
+              </th>
+              <th className="text-center px-3 py-3 font-semibold w-[80px]">Status</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border">
+            {loading
+              ? Array.from({ length: 6 }).map((_, i) => (
+                  <tr key={i} className="bg-background">
+                    <td className="px-4 py-3"><Skeleton className="h-4 w-24" /></td>
+                    <td className="px-4 py-3"><Skeleton className="h-4 w-40" /></td>
+                    <td className="px-4 py-3"><Skeleton className="h-4 w-40" /></td>
+                    <td className="px-3 py-3 text-center"><Skeleton className="h-5 w-12 mx-auto rounded-full" /></td>
+                  </tr>
+                ))
+              : error ? (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-8 text-center">
+                      <div className="flex flex-col items-center gap-3">
+                        <XCircle className="w-8 h-8 text-destructive" />
+                        <p className="text-sm text-muted-foreground">{error}</p>
+                        <Button onClick={() => load(activeLocale)} variant="outline" size="sm" className="gap-2">
+                          <RefreshCw className="w-3.5 h-3.5" /> Retry
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              : coverage?.fields.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                      No localizable fields found for this model.
+                    </td>
+                  </tr>
+                )
+              : coverage?.fields.map(field => (
+                  <tr key={field.name} className="bg-background hover:bg-muted/20 transition-colors">
+                    <td className="px-4 py-3 font-medium text-xs">{field.displayName}</td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">
+                      {field.defaultValue
+                        ? <span className="font-mono">{truncate(field.defaultValue)}</span>
+                        : <span className="italic">—</span>}
+                    </td>
+                    <td className="px-4 py-3 text-xs">
+                      {!coverage.entryHasLocale ? (
+                        <span className="text-muted-foreground italic">No translation</span>
+                      ) : field.targetValue ? (
+                        <span className="font-mono">{truncate(field.targetValue)}</span>
+                      ) : (
+                        <span className="text-destructive/70 italic">Not translated</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-3 text-center">
+                      {!coverage.entryHasLocale ? (
+                        <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold bg-muted text-muted-foreground">
+                          Missing
+                        </span>
+                      ) : field.isCovered ? (
+                        <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">
+                          <CheckCircle2 className="w-3 h-3" />Done
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold bg-destructive/10 text-destructive">
+                          <XCircle className="w-3 h-3" />Empty
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Studio link */}
+      {entry.studioUrl !== '#' && (
+        <div className="flex justify-end">
+          <a href={entry.studioUrl} target="_blank" rel="noopener noreferrer">
+            <Button variant="outline" size="sm" className="gap-1.5 text-xs">
+              Open in Studio <ExternalLink className="w-3 h-3" />
+            </Button>
+          </a>
         </div>
       )}
     </div>
