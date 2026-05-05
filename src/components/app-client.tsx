@@ -42,6 +42,7 @@ import {
   Loader2,
   LogOut,
   RefreshCw,
+  Search,
   Stethoscope,
   XCircle,
 } from 'lucide-react'
