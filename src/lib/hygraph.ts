@@ -56,27 +56,16 @@ export async function fetchLocales(creds: HygraphCredentials): Promise<HygraphLo
   const values: Array<{ name: string }> = enumData?.__type?.enumValues ?? []
   if (!values.length) throw new Error('No locales found — is localisation enabled on this project?')
 
-  // Detect true default locale from schema: the 'locales' arg on any localized
-  // query field carries a defaultValue like "[en]" or "[en_US]"
+  // Detect true default locale via content query — querying without a locales arg
+  // returns entries in the default locale, so the returned locale field is authoritative
   let defaultApiId = values[0]?.name
   try {
-    const schemaData = await gql(creds.endpoint, creds.token, `
-      query { __schema { queryType { fields { name args { name defaultValue } } } } }
+    const assetData = await gql(creds.endpoint, creds.token, `
+      query { entries: assets(first: 1) { locale } }
     `)
-    const fields: Array<{ args: Array<{ name: string; defaultValue: string | null }> }> =
-      schemaData.__schema?.queryType?.fields ?? []
-    outer: for (const f of fields) {
-      for (const a of f.args) {
-        if (a.name === 'locales' && a.defaultValue) {
-          const m = a.defaultValue.match(/\b(\w+)\b/)
-          if (m?.[1] && values.some(v => v.name === m[1])) {
-            defaultApiId = m[1]
-            break outer
-          }
-        }
-      }
-    }
-  } catch { /* fallback to first */ }
+    const detected = (assetData.entries?.[0] as { locale?: string } | undefined)?.locale
+    if (detected && values.some(v => v.name === detected)) defaultApiId = detected
+  } catch { /* fallback to first enum value */ }
 
   return values.map(v => ({
     id: v.name,
@@ -188,20 +177,22 @@ async function countViaScan(
   const PAGE = 500
   let skip = 0
 
+  // Hygraph v2 requires explicit locales arg on localizations{}. Instead, query each
+  // locale as a separate alias with locales:[l] and use the locale field to confirm
+  // presence (fallback-fetched entries return the default locale, not the requested one)
   while (skip < total) {
-    const data = await gql(creds.endpoint, creds.token, `
-      query {
-        entries: ${modelApiId}(first: ${PAGE}, skip: ${skip}) {
-          localizations { locale }
-        }
-      }
-    `)
-    const entries: Array<{ localizations: Array<{ locale: string }> }> = data.entries ?? []
-    for (const entry of entries) {
-      const has = new Set(entry.localizations.map(l => l.locale))
-      for (const l of locales) if (has.has(l)) counts[l]++
+    const aliases = locales
+      .map((l, i) => `l${i}: ${modelApiId}(locales: [${l}], first: ${PAGE}, skip: ${skip}) { locale }`)
+      .join('\n')
+    const data = await gql(creds.endpoint, creds.token, `query { ${aliases} }`)
+
+    let anyFull = false
+    for (let i = 0; i < locales.length; i++) {
+      const entries = (data[`l${i}`] as Array<{ locale: string }>) ?? []
+      counts[locales[i]] += entries.filter(e => e.locale === locales[i]).length
+      if (entries.length >= PAGE) anyFull = true
     }
-    if (entries.length < PAGE) break
+    if (!anyFull) break
     skip += PAGE
   }
   return counts
@@ -288,12 +279,13 @@ export async function fetchEntryList(
   skip: number,
 ): Promise<{ entries: EntryListItem[]; total: number }> {
   const titleField = await fetchTitleField(creds, modelType)
+  const allLocaleIds = locales.map(l => l.apiId).join(', ')
   const data = await gql(creds.endpoint, creds.token, `
     query {
       entries: ${modelApiId}(locales: [${defaultLocale}], first: ${first}, skip: ${skip}) {
         id
         ${titleField ?? ''}
-        localizations { locale }
+        localizations(locales: [${allLocaleIds}]) { locale }
       }
       total: ${modelApiId}Connection(locales: [${defaultLocale}]) { aggregate { count } }
     }
