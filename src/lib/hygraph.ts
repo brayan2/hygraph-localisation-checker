@@ -19,8 +19,12 @@ async function gql(
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ query, variables }),
   })
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+
   const json = await res.json()
+  if (!res.ok) {
+    const errorMsg = json.errors?.[0]?.message || `${res.status} ${res.statusText}`
+    throw new Error(errorMsg)
+  }
   if (json.errors?.length) throw new Error(json.errors[0].message)
   return json.data
 }
@@ -130,7 +134,11 @@ export async function fetchTotalCount(
   defaultLocale: string,
 ): Promise<number> {
   const data = await gql(creds.endpoint, creds.token, `
-    query { result: ${modelApiId}Connection { aggregate { count } } }
+    query TotalCount($locales: [Locale!]) {
+      result: ${modelApiId}Connection {
+        aggregate { count }
+      }
+    }
   `)
   return data.result?.aggregate?.count ?? 0
 }
@@ -155,13 +163,15 @@ async function countViaWhere(
 ): Promise<Record<string, number>> {
   const aliases = locales
     .map(
-      (l, i) => `l${i}: ${modelApiId}Connection(where: { localizations_some: { locale: ${l} } }) {
+      (l, i) => `l${i}: ${modelApiId}Connection(where: { localizations_some: { locale: $l${i} } }) {
         aggregate { count }
       }`,
     )
     .join('\n')
 
-  const data = await gql(creds.endpoint, creds.token, `query { ${aliases} }`)
+  const vars = Object.fromEntries(locales.map((l, i) => [`l${i}`, l]))
+  const query = `query LocalisationCounts(${locales.map((_, i) => `$l${i}: Locale!`).join(', ')}) { ${aliases} }`
+  const data = await gql(creds.endpoint, creds.token, query, vars)
   const counts: Record<string, number> = {}
   for (let i = 0; i < locales.length; i++) counts[locales[i]] = data[`l${i}`]?.aggregate?.count ?? 0
   return counts
@@ -182,9 +192,15 @@ async function countViaScan(
   // presence (fallback-fetched entries return the default locale, not the requested one)
   while (skip < total) {
     const aliases = locales
-      .map((l, i) => `l${i}: ${modelApiId}(locales: [${l}], first: ${PAGE}, skip: ${skip}) { locale }`)
+      .map((l, i) => `l${i}: ${modelApiId}(locales: [$l${i}], first: $first, skip: $skip) { locale }`)
       .join('\n')
-    const data = await gql(creds.endpoint, creds.token, `query { ${aliases} }`)
+    const vars = {
+      first: PAGE,
+      skip,
+      ...Object.fromEntries(locales.map((l, i) => [`l${i}`, l])),
+    }
+    const query = `query ScanBatch($first: Int!, $skip: Int!, ${locales.map((_, i) => `$l${i}: Locale!`).join(', ')}) { ${aliases} }`
+    const data = await gql(creds.endpoint, creds.token, query, vars)
 
     let anyFull = false
     for (let i = 0; i < locales.length; i++) {
@@ -233,14 +249,14 @@ export async function fetchMissingForLocale(
   while (hasMore) {
     try {
       const data = await gql(creds.endpoint, creds.token, `
-        query {
-          entries: ${modelApiId}(locales: [${defaultLocale}], first: ${PAGE}, skip: ${skip}) {
+        query MissingForLocale($first: Int!, $skip: Int!, $locales: [Locale!]) {
+          entries: ${modelApiId}(locales: $locales, first: $first, skip: $skip) {
             id
             ${titleField ?? ''}
-            localizations(locales: [${locale}]) { locale }
+            localizations(locales: $locales) { locale }
           }
         }
-      `)
+      `, { first: PAGE, skip, locales: [locale, defaultLocale] })
       const entries: Array<{
         id: string; localizations: Array<{ locale: string }>; [k: string]: unknown
       }> = data.entries ?? []
@@ -281,15 +297,15 @@ export async function fetchEntryList(
   const titleField = await fetchTitleField(creds, modelType)
   const allLocaleIds = locales.map(l => l.apiId).join(', ')
   const data = await gql(creds.endpoint, creds.token, `
-    query {
-      entries: ${modelApiId}(locales: [${defaultLocale}], first: ${first}, skip: ${skip}) {
+    query EntryList($first: Int!, $skip: Int!, $locales: [Locale!]) {
+      entries: ${modelApiId}(locales: $locales, first: $first, skip: $skip) {
         id
         ${titleField ?? ''}
-        localizations(locales: [${allLocaleIds}]) { locale }
+        localizations(locales: $locales) { locale }
       }
       total: ${modelApiId}Connection { aggregate { count } }
     }
-  `)
+  `, { first, skip, locales: locales.map(l => l.apiId) })
 
   const projectId = extractProjectId(creds.endpoint)
   return {
@@ -358,20 +374,20 @@ export async function fetchEntryFieldCoverage(
 
   if (fieldSelections) {
     const data = await gql(creds.endpoint, creds.token, `
-      query {
+      query EntryFieldCoverage($id: ID!, $locales: [Locale!]) {
         entries: ${modelApiId}(
-          locales: [${localesToFetch.join(', ')}],
-          where: { id: "${entryId}" }
+          locales: $locales,
+          where: { id: $id }
         ) {
           id
           ${titleField ?? ''}
-          localizations(locales: [${localesToFetch.join(', ')}]) {
+          localizations(locales: $locales) {
             locale
             ${fieldSelections}
           }
         }
       }
-    `)
+    `, { id: entryId, locales: localesToFetch })
     entry = ((data.entries as Array<Record<string, unknown>>) ?? [])[0] ?? null
   }
 
@@ -422,10 +438,12 @@ export async function fetchLocalizationStageHealth(
 
   try {
     const aliases = locales.flatMap((l, i) => [
-      `d${i}: ${modelApiId}Connection(where: { stage: DRAFT, localizations_some: { locale: ${l} } }) { aggregate { count } }`,
-      `p${i}: ${modelApiId}Connection(where: { stage: PUBLISHED, localizations_some: { locale: ${l} } }) { aggregate { count } }`,
+      `d${i}: ${modelApiId}Connection(where: { stage: DRAFT, localizations_some: { locale: $l${i} } }) { aggregate { count } }`,
+      `p${i}: ${modelApiId}Connection(where: { stage: PUBLISHED, localizations_some: { locale: $l${i} } }) { aggregate { count } }`,
     ]).join('\n')
-    const data = await gql(creds.endpoint, creds.token, `query { ${aliases} }`)
+    const vars = Object.fromEntries(locales.map((l, i) => [`l${i}`, l]))
+    const query = `query StageHealth(${locales.map((_, i) => `$l${i}: Locale!`).join(', ')}) { ${aliases} }`
+    const data = await gql(creds.endpoint, creds.token, query, vars)
     return locales.map((l, i) => {
       const draft = data[`d${i}`]?.aggregate?.count ?? 0
       const published = data[`p${i}`]?.aggregate?.count ?? 0
