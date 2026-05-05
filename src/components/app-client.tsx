@@ -497,7 +497,7 @@ function DashboardContent({
     const blob = new Blob([csv], { type: 'text/csv' })
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)
-    a.download = 'hylocale-coverage.csv'
+    a.download = `hylocale-coverage-${stage.toLowerCase()}.csv`
     a.click()
   }
 
