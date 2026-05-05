@@ -139,6 +139,8 @@ export async function fetchTotalCount(
   defaultLocale: string,
   stage: HygraphStage = 'PUBLISHED',
 ): Promise<number> {
+  // If stage is DRAFT, we want "Draft Only". 
+  // We'll calculate it in the dashboard, but here we return DRAFT count
   const s = stage === 'PUBLISHED' ? 'PUBLISHED' : 'DRAFT'
   try {
     const data = await gql(creds.endpoint, creds.token, `
@@ -179,7 +181,7 @@ export async function fetchLocalisationCounts(
   stage: HygraphStage = 'PUBLISHED',
 ): Promise<Record<string, number>> {
   if (stage === 'BOTH') {
-    return await fetchLocalisationCounts(creds, modelApiId, locales, total, 'DRAFT')
+    return await fetchLocalisationCountsRaw(creds, modelApiId, locales, total, 'DRAFT')
   }
   
   const countsDraft = await fetchLocalisationCountsRaw(creds, modelApiId, locales, total, 'DRAFT')
@@ -203,9 +205,13 @@ async function fetchLocalisationCountsRaw(
   stage: 'DRAFT' | 'PUBLISHED',
 ): Promise<Record<string, number>> {
   try {
-    const aliases = locales
-      .map((l, i) => `l${i}: ${modelApiId}Connection(stage: ${stage}, where: { localizations_some: { locale: ${l} } }) { aggregate { count } }`)
-      .join('\n')
+  const aliases = locales
+    .map(
+      (l, i) => `l${i}: ${modelApiId}Connection(stage: ${stage}, where: { localizations_some: { locale: ${l} } }) {
+        aggregate { count }
+      }`,
+    )
+    .join('\n')
     const data = await gql(creds.endpoint, creds.token, `query { ${aliases} }`)
     const counts: Record<string, number> = {}
     for (let i = 0; i < locales.length; i++) counts[locales[i]] = data[`l${i}`]?.aggregate?.count ?? 0
@@ -285,7 +291,8 @@ export async function fetchEntryList(
     }
   `, { first, skip })
 
-  const items = ((data.entries ?? []) as any[]).map(e => ({
+  const rawEntries = (data.entries ?? []) as any[]
+  let items = rawEntries.map(e => ({
     id: e.id,
     title: titleField ? String(e[titleField] ?? '') || e.id : e.id,
     localePresentMap: Object.fromEntries(
@@ -296,6 +303,11 @@ export async function fetchEntryList(
       ? `https://app.hygraph.com/projects/${projectId}/master/content/${modelType}/view/${modelApiId}/${e.id}`
       : '#',
   }))
+
+  if (stage === 'DRAFT') {
+    // Strictly Draft Only: exists in DRAFT but NOT in PUBLISHED
+    items = items.filter(e => e.stages.includes('DRAFT') && !e.stages.includes('PUBLISHED'))
+  }
 
   return { entries: items, total: 0 }
 }
@@ -316,7 +328,11 @@ export async function fetchLocalizableFields(
         .filter(f => !SYSTEM_FIELDS.has(f.name))
         .map(f => {
           const typeName = unwrapType(f.type) ?? ''
-          return { name: f.name, typeName, isRichText: typeName === 'RichText' || typeName === 'Json' }
+          return {
+            name: f.name,
+            typeName,
+            isRichText: typeName === 'RichText' || typeName === 'Json' || f.type.kind === 'OBJECT' || f.type.kind === 'LIST',
+          }
         })
     }
   } catch { /* fallback */ }
@@ -351,7 +367,17 @@ export async function fetchEntryFieldCoverage(
   const isSameLocale = defaultLocale === targetLocale
   const localesToFetch = isSameLocale ? [defaultLocale] : [defaultLocale, targetLocale]
   const fieldSelections = localizableFields
-    .map(f => (f.isRichText ? `${f.name} { text html json }` : f.name))
+    .map(f => {
+      if (f.isRichText) {
+        // Handle RichText, Json, and other composite objects
+        // We select common fields or just check existence via a simple property
+        if (f.typeName === 'RichText') return `${f.name} { text html json }`
+        if (f.typeName === 'Json') return f.name
+        // For Components/References, try to select something that exists
+        return `${f.name} { ... on Node { id } ... on Asset { url } }`
+      }
+      return f.name
+    })
     .join('\n')
 
   let entry: Record<string, unknown> | null = null
@@ -377,7 +403,10 @@ export async function fetchEntryFieldCoverage(
     if (v === null || v === undefined) return null
     if (typeof v === 'object') {
       const obj = v as any
-      return obj.text || obj.html || (obj.json ? JSON.stringify(obj.json) : null) || null
+      if (obj.text || obj.html || obj.json) return obj.text || obj.html || (obj.json ? JSON.stringify(obj.json) : null)
+      if (obj.id || obj.url) return obj.id || obj.url
+      // If it's a non-empty object but we don't know the fields, just return a marker
+      return Object.keys(obj).length > 0 ? '[Complex Content]' : null
     }
     const s = String(v)
     return s === '' ? null : s
