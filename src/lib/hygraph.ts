@@ -6,6 +6,7 @@ import type {
   EntryListItem,
   FieldCoverageItem,
   EntryFieldCoverage,
+  HygraphStage,
 } from '@/types'
 
 async function gql(
@@ -140,19 +141,19 @@ export async function fetchTotalCount(
   creds: HygraphCredentials,
   modelApiId: string,
   defaultLocale: string,
+  stage: HygraphStage = 'PUBLISHED',
 ): Promise<number> {
   try {
     const data = await gql(creds.endpoint, creds.token, `
       query TotalCount {
-        result: ${modelApiId}Connection {
+        result: ${modelApiId}Connection(stage: ${stage}) {
           aggregate { count }
         }
       }
     `)
     return data.result?.aggregate?.count ?? 0
   } catch (err) {
-    // Fallback: If Connection query fails (likely due to token permissions or schema version),
-    // we have to iteratively count. We use a first: 1000 approach to get it done faster.
+    // Fallback
     let total = 0
     let skip = 0
     const PAGE = 1000
@@ -160,14 +161,13 @@ export async function fetchTotalCount(
       try {
         const data = await gql(creds.endpoint, creds.token, `
           query CountFallback($skip: Int!) {
-            entries: ${modelApiId}(locales: [${defaultLocale}], first: ${PAGE}, skip: $skip) { id }
+            entries: ${modelApiId}(stage: ${stage}, locales: [${defaultLocale}], first: ${PAGE}, skip: $skip) { id }
           }
         `, { skip })
         const count = (data.entries as Array<unknown>)?.length ?? 0
         total += count
         if (count < PAGE) break
         skip += PAGE
-        // Cap fallback count to avoid infinite loops if schema is weird
         if (skip > 10000) break 
       } catch {
         break
@@ -182,11 +182,12 @@ export async function fetchLocalisationCounts(
   modelApiId: string,
   locales: string[],
   total: number,
+  stage: HygraphStage = 'PUBLISHED',
 ): Promise<Record<string, number>> {
   try {
-    return await countViaWhere(creds, modelApiId, locales)
+    return await countViaWhere(creds, modelApiId, locales, stage)
   } catch {
-    return await countViaScan(creds, modelApiId, locales, total)
+    return await countViaScan(creds, modelApiId, locales, total, stage)
   }
 }
 
@@ -194,10 +195,11 @@ async function countViaWhere(
   creds: HygraphCredentials,
   modelApiId: string,
   locales: string[],
+  stage: HygraphStage,
 ): Promise<Record<string, number>> {
   const aliases = locales
     .map(
-      (l, i) => `l${i}: ${modelApiId}Connection(where: { localizations_some: { locale: ${l} } }) {
+      (l, i) => `l${i}: ${modelApiId}Connection(stage: ${stage}, where: { localizations_some: { locale: ${l} } }) {
         aggregate { count }
       }`,
     )
@@ -214,17 +216,15 @@ async function countViaScan(
   modelApiId: string,
   locales: string[],
   total: number,
+  stage: HygraphStage,
 ): Promise<Record<string, number>> {
   const counts: Record<string, number> = Object.fromEntries(locales.map(l => [l, 0]))
   const PAGE = 500
   let skip = 0
 
-  // Hygraph v2 requires explicit locales arg on localizations{}. Instead, query each
-  // locale as a separate alias with locales:[l] and use the locale field to confirm
-  // presence (fallback-fetched entries return the default locale, not the requested one)
   while (skip < total) {
     const aliases = locales
-      .map((l, i) => `l${i}: ${modelApiId}(locales: [${l}], first: $first, skip: $skip) { locale }`)
+      .map((l, i) => `l${i}: ${modelApiId}(stage: ${stage}, locales: [${l}], first: $first, skip: $skip) { locale }`)
       .join('\n')
     const vars = { first: PAGE, skip }
     const query = `query ScanBatch($first: Int!, $skip: Int!) { ${aliases} }`
@@ -278,7 +278,7 @@ export async function fetchMissingForLocale(
     try {
       const data = await gql(creds.endpoint, creds.token, `
         query MissingForLocale($first: Int!, $skip: Int!) {
-          entries: ${modelApiId}(locales: [${defaultLocale}, ${locale}], first: $first, skip: $skip) {
+          entries: ${modelApiId}(stage: DRAFT, locales: [${defaultLocale}, ${locale}], first: $first, skip: $skip) {
             id
             ${titleField ?? ''}
             localizations(locales: [${locale}, ${defaultLocale}]) { locale }
@@ -321,13 +321,14 @@ export async function fetchEntryList(
   defaultLocale: string,
   first: number,
   skip: number,
+  stage: HygraphStage = 'PUBLISHED',
 ): Promise<{ entries: EntryListItem[]; total: number }> {
   const titleField = await fetchTitleField(creds, modelType)
   const allLocaleIds = locales.map(l => l.apiId).join(', ')
   const projectId = extractProjectId(creds.endpoint)
   const data = await gql(creds.endpoint, creds.token, `
     query EntryList($first: Int!, $skip: Int!) {
-      entries: ${modelApiId}(locales: [${defaultLocale}, ${allLocaleIds}], first: $first, skip: $skip) {
+      entries: ${modelApiId}(stage: ${stage}, locales: [${defaultLocale}, ${allLocaleIds}], first: $first, skip: $skip) {
         id
         ${titleField ?? ''}
         localizations(locales: [${allLocaleIds}]) { locale }
@@ -384,6 +385,7 @@ export async function fetchEntryFieldCoverage(
   entryId: string,
   defaultLocale: string,
   targetLocale: string,
+  stage: HygraphStage = 'PUBLISHED',
 ): Promise<EntryFieldCoverage> {
   const [localizableFields, titleField] = await Promise.all([
     fetchLocalizableFields(creds, modelType),
@@ -403,6 +405,7 @@ export async function fetchEntryFieldCoverage(
     const data = await gql(creds.endpoint, creds.token, `
       query EntryFieldCoverage($id: ID!) {
         entries: ${modelApiId}(
+          stage: ${stage},
           locales: [${localesToFetch.join(', ')}],
           where: { id: $id }
         ) {

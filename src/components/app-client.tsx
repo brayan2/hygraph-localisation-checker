@@ -25,6 +25,7 @@ import type {
   ModelStageHealth,
   EntryListItem,
   EntryFieldCoverage,
+  HygraphStage,
 } from '@/types'
 import {
   AlertCircle,
@@ -371,6 +372,7 @@ function DashboardContent({
   const [booting, setBooting] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [view, setView] = useState<CoverageView>({ kind: 'matrix' })
+  const [stage, setStage] = useState<HygraphStage>('PUBLISHED')
 
   // Use the default locale derived from the loaded locales (accurate) or fall back to prop
   const defaultLocale = locales.find(l => l.isDefault)?.apiId ?? propDefaultLocale
@@ -388,15 +390,16 @@ function DashboardContent({
         totalEntries: 0,
         locales: locs.map(l => ({ locale: l.apiId, total: 0, translated: 0, percentage: 0 })),
         status: 'loading',
+        stage: stage,
       })))
       setBooting(false)
 
       for (const model of models) {
         try {
-          const total = await fetchTotalCount(creds, model.apiId, dl)
+          const total = await fetchTotalCount(creds, model.apiId, dl, stage)
           const nonDefaultLocales = locs.filter(l => !l.isDefault).map(l => l.apiId)
           const counts = nonDefaultLocales.length
-            ? await fetchLocalisationCounts(creds, model.apiId, nonDefaultLocales, total)
+            ? await fetchLocalisationCounts(creds, model.apiId, nonDefaultLocales, total, stage)
             : {}
           setMatrixData(prev => prev.map(d => d.model.id !== model.id ? d : {
             ...d,
@@ -411,16 +414,17 @@ function DashboardContent({
                 : total > 0 ? Math.round(((counts[l.apiId] ?? 0) / total) * 100) : 100,
             })),
             status: 'done',
+            stage: stage,
           }))
         } catch {
-          setMatrixData(prev => prev.map(d => d.model.id !== model.id ? d : { ...d, status: 'error' }))
+          setMatrixData(prev => prev.map(d => d.model.id !== model.id ? d : { ...d, status: 'error', stage }))
         }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load')
       setBooting(false)
     }
-  }, [creds])
+  }, [creds, stage])
 
   useEffect(() => { load() }, [load])
 
@@ -432,6 +436,7 @@ function DashboardContent({
         locales={locales}
         defaultLocale={defaultLocale}
         localeFilter={view.localeFilter}
+        stage={stage}
         onViewFields={(entry, locale) => setView({ kind: 'fields', model: view.model, entry, locale })}
         onBack={() => setView({ kind: 'matrix' })}
       />
@@ -447,6 +452,7 @@ function DashboardContent({
         locales={locales.filter(l => !l.isDefault)}
         defaultLocale={defaultLocale}
         initialLocale={view.locale}
+        stage={stage}
         onBack={() => setView({ kind: 'entries', model: view.model, localeFilter: view.locale })}
       />
     )
@@ -492,24 +498,42 @@ function DashboardContent({
           <p className="text-xs text-muted-foreground mt-0.5">
             {booting
               ? 'Loading models…'
-              : `${matrixData.length} localised models · click a model or locale cell to drill in`}
+              : `${matrixData.length} localised models · checking ${stage.toLowerCase()} stage`}
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          {!booting && done.length > 0 && (
-            <Badge variant="secondary" className={cn(
-              'font-semibold tabular-nums',
-              overallPct === 100 ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
-                : overallPct >= 75 ? 'bg-amber-400/15 text-amber-700 dark:text-amber-400'
-                : 'bg-destructive/10 text-destructive',
-            )}>{overallPct}% overall</Badge>
-          )}
-          <Button variant="outline" size="sm" onClick={load} className="h-8 gap-1.5">
-            <RefreshCw className="w-3.5 h-3.5" /><span className="hidden sm:inline">Refresh</span>
-          </Button>
-          <Button variant="outline" size="sm" onClick={exportCSV} disabled={!done.length} className="h-8 gap-1.5">
-            <Download className="w-3.5 h-3.5" /><span className="hidden sm:inline">Export CSV</span>
-          </Button>
+        <div className="flex items-center gap-3">
+          <div className="flex bg-muted p-1 rounded-lg">
+            {(['PUBLISHED', 'DRAFT'] as HygraphStage[]).map((s) => (
+              <button
+                key={s}
+                onClick={() => setStage(s)}
+                className={cn(
+                  'px-3 py-1 text-[11px] font-semibold rounded-md transition-all',
+                  stage === s
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                )}
+              >
+                {s === 'PUBLISHED' ? 'Published' : 'Draft (Both)'}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            {!booting && done.length > 0 && (
+              <Badge variant="secondary" className={cn(
+                'font-semibold tabular-nums',
+                overallPct === 100 ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
+                  : overallPct >= 75 ? 'bg-amber-400/15 text-amber-700 dark:text-amber-400'
+                  : 'bg-destructive/10 text-destructive',
+              )}>{overallPct}% overall</Badge>
+            )}
+            <Button variant="outline" size="sm" onClick={load} className="h-8 gap-1.5">
+              <RefreshCw className="w-3.5 h-3.5" /><span className="hidden sm:inline">Refresh</span>
+            </Button>
+            <Button variant="outline" size="sm" onClick={exportCSV} disabled={!done.length} className="h-8 gap-1.5">
+              <Download className="w-3.5 h-3.5" /><span className="hidden sm:inline">Export CSV</span>
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -638,6 +662,7 @@ function EntryListView({
   locales,
   defaultLocale,
   localeFilter,
+  stage,
   onViewFields,
   onBack,
 }: {
@@ -646,6 +671,7 @@ function EntryListView({
   locales: HygraphLocale[]
   defaultLocale: string
   localeFilter: string | null
+  stage: HygraphStage
   onViewFields: (entry: EntryListItem, locale: string) => void
   onBack: () => void
 }) {
@@ -660,7 +686,7 @@ function EntryListView({
     else setLoadingMore(true)
     setError(null)
     try {
-      const result = await fetchEntryList(creds, model.apiId, model.id, locales, defaultLocale, PAGE_SIZE, skip)
+      const result = await fetchEntryList(creds, model.apiId, model.id, locales, defaultLocale, PAGE_SIZE, skip, stage)
       setEntries(prev => append ? [...prev, ...result.entries] : result.entries)
       setTotal(result.total)
     } catch (err) {
@@ -669,7 +695,7 @@ function EntryListView({
       setLoading(false)
       setLoadingMore(false)
     }
-  }, [creds, model, locales, defaultLocale])
+  }, [creds, model, locales, defaultLocale, stage])
 
   useEffect(() => { load(0) }, [load])
 
@@ -867,6 +893,7 @@ function FieldCoverageView({
   locales,
   defaultLocale,
   initialLocale,
+  stage,
   onBack,
 }: {
   creds: HygraphCredentials
@@ -875,6 +902,7 @@ function FieldCoverageView({
   locales: HygraphLocale[]
   defaultLocale: string
   initialLocale: string
+  stage: HygraphStage
   onBack: () => void
 }) {
   const [activeLocale, setActiveLocale] = useState(initialLocale)
@@ -887,14 +915,14 @@ function FieldCoverageView({
     setError(null)
     setCoverage(null)
     try {
-      const result = await fetchEntryFieldCoverage(creds, model.apiId, model.id, entry.id, defaultLocale, locale)
+      const result = await fetchEntryFieldCoverage(creds, model.apiId, model.id, entry.id, defaultLocale, locale, stage)
       setCoverage(result)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load field data')
     } finally {
       setLoading(false)
     }
-  }, [creds, model, entry, defaultLocale])
+  }, [creds, model, entry, defaultLocale, stage])
 
   useEffect(() => { load(activeLocale) }, [activeLocale, load])
 

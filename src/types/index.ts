@@ -3,6 +3,8 @@ export interface HygraphCredentials {
   token: string
 }
 
+export type HygraphStage = 'DRAFT' | 'PUBLISHED'
+
 export interface HygraphLocale {
   id: string
   apiId: string
@@ -29,6 +31,7 @@ export interface ModelLocalisationData {
   totalEntries: number
   locales: LocaleCount[]
   status: 'loading' | 'done' | 'error'
+  stage: HygraphStage
 }
 
 export interface MissingEntry {
