@@ -387,8 +387,8 @@ export async function fetchEntryFieldCoverage(
         // We select common fields or just check existence via a simple property
         if (f.typeName === 'RichText') return `${f.name} { text html json }`
         if (f.typeName === 'Json') return f.name
-        // For Components/References, try to select something that exists
-        return `${f.name} { ... on Node { id } ... on Asset { url } }`
+        // For Components/References, use __typename which is valid on all object types
+        return `${f.name} { __typename }`
       }
       return f.name
     })
@@ -522,7 +522,7 @@ export async function fetchFieldHealth(
   for (const f of fields) {
     try {
       const sel = f.isRichText
-        ? (f.typeName === 'RichText' ? `${f.name} { text }` : (f.typeName === 'Json' ? f.name : `${f.name} { id }`))
+        ? (f.typeName === 'RichText' ? `${f.name} { text }` : (f.typeName === 'Json' ? f.name : `${f.name} { __typename }`))
         : f.name
       
       // Try to query a single entry with this specific field
