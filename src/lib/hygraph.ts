@@ -336,25 +336,49 @@ export async function fetchLocalizableFields(
   creds: HygraphCredentials,
   modelType: string,
 ): Promise<Array<{ name: string; typeName: string; isRichText: boolean }>> {
-  // Fix: Instead of checking isLocalized on the base type (which fails on some APIs),
-  // we check what fields exist on the ${Model}Localization type.
   const typeFragment = `type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }`
+
+  const toResult = (f: any) => {
+    const typeName = unwrapType(f.type) ?? ''
+    const typeKind = unwrapKind(f.type)
+    return {
+      name: f.name,
+      typeName,
+      isRichText: typeName === 'RichText' || typeName === 'Json' || typeKind === 'OBJECT' || typeKind === 'LIST',
+    }
+  }
+
   try {
+    // Query both the *Localization type and the base type in one round-trip.
+    // We use aliases so a missing type just returns null rather than erroring.
     const data = await gql(creds.endpoint, creds.token, `
-      query { __type(name: "${modelType}Localization") { fields { name ${typeFragment} } } }
+      query {
+        locType:  __type(name: "${modelType}Localization") { fields { name ${typeFragment} } }
+        baseType: __type(name: "${modelType}")             { fields { name ${typeFragment} } }
+      }
     `)
-    return ((data?.__type?.fields ?? []) as any[])
-      .filter(f => !SYSTEM_FIELDS.has(f.name))
-      .map(f => {
-        const typeName = unwrapType(f.type) ?? ''
-        const typeKind = unwrapKind(f.type)
-        return {
-          name: f.name,
-          typeName,
-          isRichText: typeName === 'RichText' || typeName === 'Json' || typeKind === 'OBJECT' || typeKind === 'LIST',
-        }
-      })
+
+    // Strategy 1: use the *Localization type directly — it only contains localised fields
+    const locFields = (data?.locType?.fields ?? []) as any[]
+    if (locFields.length > 0) {
+      return locFields.filter((f: any) => !SYSTEM_FIELDS.has(f.name)).map(toResult)
+    }
+
+    // Strategy 2: follow the 'localizations' field reference on the base type to find
+    // the actual localization type name (handles non-standard naming conventions)
+    const baseFields = (data?.baseType?.fields ?? []) as any[]
+    const locFieldRef = baseFields.find((f: any) => f.name === 'localizations')
+    const locTypeName = locFieldRef ? unwrapType(locFieldRef.type) : null
+    if (locTypeName && locTypeName !== modelType) {
+      const locTypeData = await gql(creds.endpoint, creds.token, `
+        query { __type(name: "${locTypeName}") { fields { name ${typeFragment} } } }
+      `)
+      return ((locTypeData?.__type?.fields ?? []) as any[])
+        .filter((f: any) => !SYSTEM_FIELDS.has(f.name))
+        .map(toResult)
+    }
   } catch { /* ignore */ }
+
   return []
 }
 
@@ -385,25 +409,36 @@ export async function fetchEntryFieldCoverage(
     })
     .join('\n')
 
-  let entry: Record<string, unknown> | null = null
-  if (localizableFields.length > 0) {
-    // Default locale values live at the root of the entry (not inside localizations).
-    // Target locale values are fetched via localizations when it differs from the default.
-    const data = await gql(creds.endpoint, creds.token, `
-      query EntryFields($id: ID!) {
-        entries: ${modelApiId}(stage: ${s}, locales: [${defaultLocale}], where: { id: $id }) {
-          id
-          ${titleField ?? ''}
-          ${fieldSelections}
-          ${!isSameLocale ? `localizations(locales: [${targetLocale}]) {
-            locale
-            ${fieldSelections}
-          }` : ''}
-        }
-      }
-    `, { id: entryId })
-    entry = (data.entries as any[])?.[0] ?? null
+  // If no localizable fields could be detected, return empty coverage rather than erroring
+  if (localizableFields.length === 0) {
+    return {
+      entryId,
+      entryTitle: entryId,
+      defaultLocale,
+      targetLocale,
+      fields: [],
+      coveredCount: 0,
+      totalCount: 0,
+      entryHasLocale: false,
+    }
   }
+
+  // Default locale values live at the root of the entry (not inside localizations).
+  // Target locale values are fetched via localizations when it differs from the default.
+  const data = await gql(creds.endpoint, creds.token, `
+    query EntryFields($id: ID!) {
+      entries: ${modelApiId}(stage: ${s}, locales: [${defaultLocale}], where: { id: $id }) {
+        id
+        ${titleField ?? ''}
+        ${fieldSelections}
+        ${!isSameLocale ? `localizations(locales: [${targetLocale}]) {
+          locale
+          ${fieldSelections}
+        }` : ''}
+      }
+    }
+  `, { id: entryId })
+  const entry = (data.entries as any[])?.[0] ?? null
 
   if (!entry) throw new Error('Entry not found in selected stage')
 
